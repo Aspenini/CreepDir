@@ -1,5 +1,6 @@
 use clap::{CommandFactory, Parser};
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -49,19 +50,20 @@ fn main() {
         return;
     }
 
-    let folder = cli.folder.unwrap();
+    let folder = normalize_path(cli.folder.unwrap());
 
     // Determine output path
     let output_path = if let Some(output) = cli.output {
+        let normalized_output = normalize_path(output);
         // If output exists and is a directory, create filename based on folder name
-        if output.is_dir() {
+        if normalized_output.is_dir() {
             let folder_name = folder.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("output");
-            output.join(format!("{}.txt", folder_name))
+            normalized_output.join(format!("{}.txt", folder_name))
         } else {
             // Output is a specific file path (may or may not exist yet)
-            output
+            normalized_output
         }
     } else {
         // Default: save in the scanned folder
@@ -110,10 +112,53 @@ fn run_with_dialogs() {
     scan_folder(&folder_path, &output_path);
 }
 
+/// Normalize and resolve a path to work cross-platform
+/// Handles paths starting with / on Windows by treating them as relative
+fn normalize_path(path: PathBuf) -> PathBuf {
+    // On Windows, if path starts with / but isn't a valid absolute path (no drive letter),
+    // treat it as relative to current directory
+    #[cfg(windows)]
+    {
+        let path_str = path.to_string_lossy().to_string();
+        // Check if it's a Unix-style path that starts with / but isn't a valid Windows path
+        // Windows absolute paths are: C:\... or \\server\share
+        if path_str.starts_with('/') && path_str.len() > 1 {
+            let second_char = path_str.chars().nth(1);
+            // If second character isn't ':' (drive letter) or '/' (UNC path), it's invalid on Windows
+            // Convert to relative by stripping the leading /
+            if second_char != Some(':') && second_char != Some('/') && second_char != Some('\\') {
+                let relative = PathBuf::from(&path_str[1..]);
+                if let Ok(cwd) = env::current_dir() {
+                    return cwd.join(&relative);
+                }
+            }
+        }
+    }
+
+    // If path is already absolute, return it as-is
+    if path.is_absolute() {
+        return path;
+    }
+
+    // If path is relative, resolve it relative to current directory
+    if let Ok(cwd) = env::current_dir() {
+        return cwd.join(&path);
+    }
+
+    // Fallback: return the original path
+    path
+}
+
 fn scan_folder(folder: &Path, output_path: &Path) {
     // Validate input folder exists
     if !folder.exists() {
         eprintln!("Error: Folder '{}' does not exist", folder.display());
+        if folder.is_relative() {
+            if let Ok(cwd) = env::current_dir() {
+                eprintln!("Current directory: {}", cwd.display());
+                eprintln!("Tried to resolve: {}", cwd.join(folder).display());
+            }
+        }
         std::process::exit(1);
     }
 
