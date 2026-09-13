@@ -1,100 +1,99 @@
 //! High-level orchestration: validate input, run the scan, write output.
 
-use crate::config::{OutputFormat, ScanFilter, ScanOptions};
-use crate::output;
-use crate::scan::{self, Catalog, FileEntry, ScanStats};
-use crate::{cli, exit_error};
 use std::fs;
+use std::io;
 use std::path::Path;
 
+use crate::cli;
+use crate::config::{OutputFormat, ScanFilter, ScanOptions};
+use crate::error::Error;
+use crate::output;
+use crate::scan::{self, ScanStats};
+
 /// Run an interactive scan, picking folder and output location via file dialogs.
-pub fn run_with_dialogs(options: &ScanOptions, filter: &ScanFilter) {
-    let folder = match rfd::FileDialog::new()
+pub fn run_with_dialogs(options: &ScanOptions, filter: &ScanFilter) -> Result<(), Error> {
+    let Some(folder) = rfd::FileDialog::new()
         .set_title("Select Folder to Scan")
         .pick_folder()
-    {
-        Some(path) => path,
-        None => {
-            eprintln!("No folder selected.");
-            std::process::exit(0);
-        }
+    else {
+        eprintln!("No folder selected.");
+        return Ok(());
     };
 
     let default_name = cli::default_filename(&folder, options.format.extension());
-    let output_path = match rfd::FileDialog::new()
+    let Some(output_path) = rfd::FileDialog::new()
         .set_title("Select Output Location")
         .set_file_name(&default_name)
         .save_file()
-    {
-        Some(path) => path,
-        None => {
-            eprintln!("No output location selected.");
-            std::process::exit(0);
-        }
+    else {
+        eprintln!("No output location selected.");
+        return Ok(());
     };
 
-    run(&folder, &output_path, options, filter);
+    run(&folder, &output_path, options, filter)
 }
 
 /// Validate the target, scan it, and write the catalog in the chosen format.
-pub fn run(folder: &Path, output_path: &Path, options: &ScanOptions, filter: &ScanFilter) {
-    if !folder.exists() {
-        eprintln!("Error: Folder '{}' does not exist", folder.display());
-        if folder.is_relative()
-            && let Ok(cwd) = std::env::current_dir()
-        {
-            eprintln!("Current directory: {}", cwd.display());
-            eprintln!("Tried to resolve: {}", cwd.join(folder).display());
+pub fn run(
+    folder: &Path,
+    output_path: &Path,
+    options: &ScanOptions,
+    filter: &ScanFilter,
+) -> Result<(), Error> {
+    let meta = fs::metadata(folder).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            Error::not_found(folder)
+        } else {
+            Error::io("reading folder", e)
         }
-        std::process::exit(1);
-    }
-    if !folder.is_dir() {
-        exit_error(&format!("'{}' is not a directory", folder.display()));
+    })?;
+    if !meta.is_dir() {
+        return Err(Error::NotADirectory(folder.to_path_buf()));
     }
 
-    ensure_parent_dir(output_path);
+    ensure_parent_dir(output_path)?;
 
     // CSV streams straight to disk (flat memory); text/JSON group in memory first.
     let stats = match options.format {
         OutputFormat::Csv => output::csv::write_streaming(folder, output_path, options, filter)
-            .unwrap_or_else(|e| exit_error(&format!("writing output file: {e}"))),
+            .map_err(|e| Error::io("writing output file", e))?,
         OutputFormat::Text | OutputFormat::Json => {
-            let mut catalog: Catalog = Catalog::new();
-            let stats = scan::walk(folder, options, filter, |ext, path, size| {
-                catalog.entry(ext).or_default().push(FileEntry { path, size });
-            });
+            let (catalog, stats) = scan::catalog(folder, options, filter);
             write_grouped(&catalog, &stats, folder, output_path, options)
-                .unwrap_or_else(|e| exit_error(&format!("writing output file: {e}")));
+                .map_err(|e| Error::io("writing output file", e))?;
             stats
         }
     };
 
     print_summary(&stats, options);
     println!("Saved to: {}", output_path.display());
+    Ok(())
 }
 
 /// Write a grouped catalog as text or JSON.
 fn write_grouped(
-    catalog: &Catalog,
+    catalog: &scan::Catalog,
     stats: &ScanStats,
     folder: &Path,
     output_path: &Path,
     options: &ScanOptions,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     match options.format {
         OutputFormat::Json => output::json::write(catalog, stats, folder, output_path, options),
-        _ => output::text::write(catalog, output_path, options),
+        OutputFormat::Text => output::text::write(catalog, output_path, options),
+        OutputFormat::Csv => unreachable!("CSV is streamed, not grouped"),
     }
 }
 
 /// Create the output file's parent directory if needed.
-fn ensure_parent_dir(output_path: &Path) {
-    if let Some(parent) = output_path.parent()
-        && !parent.as_os_str().is_empty()
-        && let Err(e) = fs::create_dir_all(parent)
-    {
-        exit_error(&format!("creating output directory: {e}"));
+fn ensure_parent_dir(output_path: &Path) -> Result<(), Error> {
+    let Some(parent) = output_path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
     }
+    fs::create_dir_all(parent).map_err(|e| Error::io("creating output directory", e))
 }
 
 /// Print the post-scan summary line to stdout.

@@ -1,41 +1,43 @@
 mod app;
 mod cli;
 mod config;
+mod error;
 mod output;
 mod scan;
 
-use clap::{CommandFactory, Parser};
+use std::process::ExitCode;
+
+use clap::Parser;
 use cli::Cli;
+use error::Error;
 
-fn main() {
-    let args = Cli::parse();
-
-    let options = args.scan_options();
-    let filter = args
-        .scan_filter()
-        .unwrap_or_else(|e| exit_error(&e));
-
-    if args.select {
-        if args.folder.is_some() || args.output.is_some() {
-            exit_error("--select cannot be used with path arguments");
+fn main() -> ExitCode {
+    match try_main() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            ExitCode::FAILURE
         }
-        app::run_with_dialogs(&options, &filter);
-        return;
+    }
+}
+
+fn try_main() -> Result<(), Error> {
+    let cli = Cli::parse();
+    let options = cli.scan_options();
+    let filter = cli.scan_filter()?;
+
+    if cli.select {
+        if cli.folder.is_some() || cli.output.is_some() {
+            return Err(Error::SelectWithPaths);
+        }
+        return app::run_with_dialogs(&options, &filter);
     }
 
-    let Some(folder) = args.folder.clone() else {
-        Cli::command().print_help().unwrap();
-        return;
+    let Some(folder) = cli.folder else {
+        return Err(Error::MissingFolder);
     };
 
     let folder = cli::normalize_path(folder);
-    let output_path = cli::resolve_output_path(args.output.clone(), &folder, options.format);
-
-    app::run(&folder, &output_path, &options, &filter);
-}
-
-/// Print an error to stderr and exit with a non-zero status.
-pub fn exit_error(message: &str) -> ! {
-    eprintln!("Error: {message}");
-    std::process::exit(1);
+    let output_path = cli::resolve_output_path(cli.output, &folder, options.format);
+    app::run(&folder, &output_path, &options, &filter)
 }

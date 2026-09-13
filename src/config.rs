@@ -1,10 +1,12 @@
 //! Configuration types shared across the scanner and output writers.
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
+
 /// Output format for the generated catalog.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputFormat {
     Text,
     Json,
@@ -13,28 +15,30 @@ pub enum OutputFormat {
 
 impl OutputFormat {
     /// Choose a format from the mutually-exclusive `--json` / `--csv` flags.
+    #[must_use]
     pub fn from_flags(json: bool, csv: bool) -> Self {
         if json {
-            OutputFormat::Json
+            Self::Json
         } else if csv {
-            OutputFormat::Csv
+            Self::Csv
         } else {
-            OutputFormat::Text
+            Self::Text
         }
     }
 
     /// Default file extension for this format.
+    #[must_use]
     pub fn extension(self) -> &'static str {
         match self {
-            OutputFormat::Text => "txt",
-            OutputFormat::Json => "json",
-            OutputFormat::Csv => "csv",
+            Self::Text => "txt",
+            Self::Json => "json",
+            Self::Csv => "csv",
         }
     }
 }
 
 /// Options that control how a scan is performed.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ScanOptions {
     /// Suppress per-folder warnings for inaccessible paths.
     pub quiet: bool,
@@ -51,9 +55,10 @@ pub struct ScanOptions {
 }
 
 /// Decides which files are included in the catalog.
+#[derive(Debug)]
 pub struct ScanFilter {
     /// Allow-list of dot-prefixed lowercase extensions (e.g. `.rs`). `None` = all.
-    ext: Option<Vec<String>>,
+    ext: Option<HashSet<String>>,
     /// Glob patterns; matching files/dirs are excluded (dirs are pruned).
     exclude: Option<Arc<GlobSet>>,
 }
@@ -69,7 +74,10 @@ impl ScanFilter {
             Some(
                 ext_args
                     .iter()
-                    .map(|e| format!(".{}", e.trim().trim_start_matches('.').to_lowercase()))
+                    .filter_map(|raw| {
+                        let ext = raw.trim().trim_start_matches('.').to_lowercase();
+                        (!ext.is_empty()).then(|| format!(".{ext}"))
+                    })
                     .collect(),
             )
         };
@@ -89,19 +97,55 @@ impl ScanFilter {
             Some(Arc::new(set))
         };
 
-        Ok(ScanFilter { ext, exclude })
+        Ok(Self { ext, exclude })
     }
 
     /// Whether a file with the given extension key should be included.
+    #[must_use]
     pub fn ext_allowed(&self, ext: &str) -> bool {
-        match &self.ext {
-            Some(allowed) => allowed.iter().any(|e| e == ext),
-            None => true,
-        }
+        self.ext
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(ext))
     }
 
     /// The compiled exclude set, if any exclude patterns were given.
+    #[must_use]
     pub fn exclude(&self) -> Option<&Arc<GlobSet>> {
         self.exclude.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_flags_prefers_json_then_csv() {
+        assert_eq!(OutputFormat::from_flags(false, false), OutputFormat::Text);
+        assert_eq!(OutputFormat::from_flags(true, false), OutputFormat::Json);
+        assert_eq!(OutputFormat::from_flags(false, true), OutputFormat::Csv);
+    }
+
+    #[test]
+    fn ext_filter_normalizes_and_dedups() {
+        let filter =
+            ScanFilter::new(&["RS".into(), ".txt".into(), "rs".into(), "  ".into()], &[]).unwrap();
+        assert!(filter.ext_allowed(".rs"));
+        assert!(filter.ext_allowed(".txt"));
+        assert!(!filter.ext_allowed(".md"));
+        assert!(!filter.ext_allowed(""));
+    }
+
+    #[test]
+    fn empty_ext_args_allows_everything() {
+        let filter = ScanFilter::new(&[], &[]).unwrap();
+        assert!(filter.ext_allowed(".rs"));
+        assert!(filter.ext_allowed(""));
+    }
+
+    #[test]
+    fn invalid_exclude_glob_is_reported() {
+        let err = ScanFilter::new(&[], &["[".into()]).unwrap_err();
+        assert!(err.contains("invalid --exclude pattern"), "{err}");
     }
 }

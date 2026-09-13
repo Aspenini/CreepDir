@@ -1,25 +1,27 @@
 [package]
-name = "CreepDir"
-version = "0.2.0"
+name = "creepdir"
+version = "0.3.0"
 edition = "2024"
-description = "A CLI tool to scan folders and catalog files by extension"
+rust-version = "1.88"
+description = "Fast CLI that recursively catalogs files by extension"
 license = "MIT"
 repository = "https://github.com/Aspenini/CreepDir"
+homepage = "https://github.com/Aspenini/CreepDir"
+readme = "README.md"
 keywords = ["directory", "scanner", "file-catalog", "cli"]
 categories = ["command-line-utilities", "filesystem"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-rfd = "0.14"
+rfd = "0.17"
 jwalk = "0.8"
 globset = "0.4"
+
+[lints.rust]
+unsafe_code = "forbid"
 
 [profile.release]
 lto = true
 codegen-units = 1
 panic = "abort"
-
-[[bin]]
-name = "CreepDir"
-path = "src/main.rs"
-
+strip = true

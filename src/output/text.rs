@@ -1,19 +1,24 @@
 //! Plain-text output: files grouped under `--- .ext (N files) ---` headers.
 
-use super::{buffered_writer, human_size, sorted_extensions};
-use crate::config::ScanOptions;
-use crate::scan::Catalog;
 use std::io::{self, Write};
 use std::path::Path;
 
+use super::{buffered_writer, human_size, sorted_extensions};
+use crate::config::ScanOptions;
+use crate::scan::Catalog;
+
+/// Write `catalog` as grouped text. Each extension bucket is assumed sorted by path.
 pub fn write(catalog: &Catalog, output_path: &Path, options: &ScanOptions) -> io::Result<()> {
     let mut writer = buffered_writer(output_path)?;
 
     for ext in sorted_extensions(catalog) {
-        let mut entries: Vec<_> = catalog[ext].iter().collect();
-        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let entries = &catalog[ext];
 
-        let label = if ext.is_empty() { "(no extension)" } else { ext };
+        let label = if ext.is_empty() {
+            "(no extension)"
+        } else {
+            ext
+        };
         if options.sizes {
             let total: u64 = entries.iter().filter_map(|e| e.size).sum();
             writeln!(

@@ -1,18 +1,22 @@
 //! Parallel filesystem traversal that groups files by extension.
 
-use crate::config::{ScanFilter, ScanOptions};
-use globset::GlobSet;
-use jwalk::{Parallelism, WalkDir};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use globset::GlobSet;
+use jwalk::{Parallelism, WalkDir};
+
+use crate::config::{ScanFilter, ScanOptions};
+
 /// Files grouped by their extension key (e.g. `.rs`).
+///
+/// Each bucket is sorted by path when produced by [`catalog`].
 pub type Catalog = HashMap<String, Vec<FileEntry>>;
 
 /// Summary counts produced by a scan.
-#[derive(Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ScanStats {
     pub files: u64,
     pub dirs: u64,
@@ -22,9 +26,27 @@ pub struct ScanStats {
 }
 
 /// A single catalogued file.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
     pub path: PathBuf,
     pub size: Option<u64>,
+}
+
+/// Walk `root` recursively, invoke `on_file` for each included file, sort each
+/// extension bucket by path, and return the catalog plus [`ScanStats`].
+#[must_use]
+pub fn catalog(root: &Path, options: &ScanOptions, filter: &ScanFilter) -> (Catalog, ScanStats) {
+    let mut catalog = Catalog::new();
+    let stats = walk(root, options, filter, |ext, path, size| {
+        catalog
+            .entry(ext)
+            .or_default()
+            .push(FileEntry { path, size });
+    });
+    for entries in catalog.values_mut() {
+        entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    }
+    (catalog, stats)
 }
 
 /// Walk `root` recursively, invoking `on_file(ext, relative_path, size)` for each
@@ -130,16 +152,140 @@ fn path_excluded(exclude: &GlobSet, root: &Path, full: &Path, file_name: &OsStr)
 
 /// Build the lowercase, dot-prefixed extension key for a file (e.g. `.txt`).
 /// Files without an extension map to an empty string.
+#[must_use]
 pub fn extension_key(path: &Path) -> String {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) => {
-            let mut key = String::with_capacity(ext.len() + 1);
-            key.push('.');
-            for c in ext.chars() {
-                key.extend(c.to_lowercase());
-            }
-            key
+    let Some(ext) = path.extension().and_then(OsStr::to_str) else {
+        return String::new();
+    };
+
+    let mut key = String::with_capacity(ext.len() + 1);
+    key.push('.');
+    if ext.is_ascii() {
+        key.extend(ext.bytes().map(|b| b.to_ascii_lowercase() as char));
+    } else {
+        key.extend(ext.chars().flat_map(char::to_lowercase));
+    }
+    key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OutputFormat;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn options(sizes: bool) -> ScanOptions {
+        ScanOptions {
+            quiet: true,
+            threads: Some(1),
+            follow_symlinks: false,
+            max_depth: None,
+            sizes,
+            format: OutputFormat::Text,
         }
-        None => String::new(),
+    }
+
+    fn with_temp_tree(files: &[(&str, &[u8])]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "creepdir-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for (rel, bytes) in files {
+            let path = dir.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, bytes).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn extension_key_lowercases_ascii() {
+        assert_eq!(extension_key(Path::new("Foo.RS")), ".rs");
+        assert_eq!(extension_key(Path::new("a.TXT")), ".txt");
+        assert_eq!(extension_key(Path::new("Makefile")), "");
+        assert_eq!(extension_key(Path::new("archive.tar.gz")), ".gz");
+    }
+
+    #[test]
+    fn catalog_groups_by_extension_and_sorts_paths() {
+        let root = with_temp_tree(&[
+            ("z.rs", b"1"),
+            ("a.rs", b"22"),
+            ("notes.TXT", b"abc"),
+            ("README", b"nope"),
+            ("sub/b.rs", b""),
+        ]);
+        let filter = ScanFilter::new(&[], &[]).unwrap();
+        let (catalog, stats) = catalog(&root, &options(true), &filter);
+
+        assert_eq!(stats.files, 5);
+        assert!(stats.dirs >= 1);
+        assert_eq!(stats.total_size, 1 + 2 + 3 + 4);
+
+        let rs = &catalog[".rs"];
+        assert_eq!(
+            rs.iter()
+                .map(|e| e.path.to_string_lossy().replace('\\', "/"))
+                .collect::<Vec<_>>(),
+            ["a.rs", "sub/b.rs", "z.rs"]
+        );
+        assert_eq!(catalog[".txt"].len(), 1);
+        assert_eq!(catalog[""].len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ext_and_exclude_filters() {
+        let root = with_temp_tree(&[
+            ("keep.rs", b"a"),
+            ("skip.tmp", b"b"),
+            ("node_modules/lib.rs", b"c"),
+            ("src/main.rs", b"d"),
+        ]);
+        let filter =
+            ScanFilter::new(&["rs".into()], &["*.tmp".into(), "node_modules".into()]).unwrap();
+        let (catalog, stats) = catalog(&root, &options(false), &filter);
+
+        assert_eq!(stats.files, 2);
+        assert!(catalog.contains_key(".rs"));
+        assert!(!catalog.contains_key(".tmp"));
+        let paths: Vec<_> = catalog[".rs"]
+            .iter()
+            .map(|e| e.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(paths.contains(&"keep.rs".into()));
+        assert!(paths.contains(&"src/main.rs".into()));
+        assert!(!paths.iter().any(|p| p.contains("node_modules")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn max_depth_zero_is_root_only() {
+        let root = with_temp_tree(&[("root.rs", b"a"), ("nested/deep.rs", b"b")]);
+        let mut opts = options(false);
+        opts.max_depth = Some(0);
+        let filter = ScanFilter::new(&[], &[]).unwrap();
+        let (catalog, stats) = catalog(&root, &opts, &filter);
+
+        // jwalk's max_depth 0 is the starting dir itself (no children).
+        assert_eq!(stats.files, 0, "root-only depth should not list children");
+        assert!(catalog.is_empty());
+
+        opts.max_depth = Some(1);
+        let (catalog, stats) = super::catalog(&root, &opts, &filter);
+        assert_eq!(stats.files, 1);
+        assert!(catalog[".rs"].iter().any(|e| e.path.ends_with("root.rs")));
+
+        let _ = fs::remove_dir_all(root);
     }
 }
